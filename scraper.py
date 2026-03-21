@@ -1,5 +1,5 @@
 """
-ABDL Catalog System — scraper.py
+Catalog Scraper — scraper.py
 
 Playwright multi-thread fix:
   - playwright sync_api is greenlet-based and CANNOT be shared across threads.
@@ -7,7 +7,7 @@ Playwright multi-thread fix:
     uses it, then tears it all down. No shared browser globals.
   - MAX_CONCURRENT = 4  (up to 4 browser processes running simultaneously)
 """
-import re, time, random, json, logging, threading
+import re, time, random, json, logging, threading, socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urljoin
@@ -24,19 +24,31 @@ except ImportError:
 from database import (get_scrape_sites, upsert_product, add_scrape_log,
                       should_scrape_site, next_scrape_time as _next_scrape_time)
 
-log = logging.getLogger("ABDLScraper")
+log = logging.getLogger("Scraper")
 
 MAX_CONCURRENT = 4   # simultaneous browser processes
 
 _USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Chrome 140 on Windows 10/11 — matches the installed Playwright Chromium version
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    # Edge on Windows (shares Chromium engine)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0",
+    # Firefox as occasional variant
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
 ]
+
+# Sec-CH-UA hints aligned with each UA above — picked at context creation time
+_SEC_CH_UA = {
+    "140": '"Chromium";v="140","Google Chrome";v="140","Not.A/Brand";v="99"',
+    "139": '"Chromium";v="139","Google Chrome";v="139","Not.A/Brand";v="99"',
+    "138": '"Chromium";v="138","Google Chrome";v="138","Not.A/Brand";v="99"',
+    "140e": '"Chromium";v="140","Microsoft Edge";v="140","Not.A/Brand";v="99"',
+    "139e": '"Chromium";v="139","Microsoft Edge";v="139","Not.A/Brand";v="99"',
+    "ff":   "",   # Firefox doesn't send Sec-CH-UA
+}
 
 FX = {"usd":1.00,"$":1.00,"cad":0.74,"c$":0.74,"ca$":0.74,
       "eur":1.09,"€":1.09,"gbp":1.27,"£":1.27,"aud":0.66,"a$":0.66}
@@ -64,52 +76,100 @@ _STEALTH_JS = """
 class _ThreadBrowser:
     """
     Context manager that owns a complete playwright stack for one thread.
+    Includes automatic Chromium crash recovery — if the browser dies mid-scrape
+    (ERR_ABORTED / Connection closed / TargetClosed) it relaunches once and retries.
+
     Usage:
         with _ThreadBrowser() as tb:
             soup = tb.get_page("https://example.com")
     """
+    # Exceptions that indicate Chromium itself has died (not just a bad page)
+    _CRASH_MSGS = (
+        "connection closed while reading from the driver",
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "connection closed",
+        "target closed",
+    )
+
     def __init__(self):
         self._pw   = None
         self._brow = None
         self._ctx  = None
         self.page  = None
+        self._dead = False   # set True after unrecoverable crash
 
     def __enter__(self):
+        self._launch()
+        return self
+
+    def _launch(self):
+        """Start (or restart) the full playwright stack."""
         self._pw   = sync_playwright().start()
         self._brow = self._pw.chromium.launch(headless=True, args=_CHROMIUM_ARGS)
         ua = random.choice(_USER_AGENTS)
+
+        if "Edg/140" in ua:      sec_ch = _SEC_CH_UA["140e"]
+        elif "Edg/139" in ua:    sec_ch = _SEC_CH_UA["139e"]
+        elif "Chrome/140" in ua: sec_ch = _SEC_CH_UA["140"]
+        elif "Chrome/139" in ua: sec_ch = _SEC_CH_UA["139"]
+        elif "Chrome/138" in ua: sec_ch = _SEC_CH_UA["138"]
+        else:                    sec_ch = ""
+
+        extra_headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+            "DNT":             "1",
+        }
+        if sec_ch:
+            extra_headers["Sec-CH-UA"]          = sec_ch
+            extra_headers["Sec-CH-UA-Mobile"]   = "?0"
+            extra_headers["Sec-CH-UA-Platform"] = '"Windows"'
+
         self._ctx = self._brow.new_context(
             viewport={"width": 1366, "height": 768},
             user_agent=ua, locale="en-US", timezone_id="America/Chicago",
-            extra_http_headers={
-                "Accept-Language":   "en-US,en;q=0.9",
-                "Accept":            "text/html,application/xhtml+xml,*/*;q=0.8",
-                "Sec-CH-UA":         '"Chromium";v="124","Google Chrome";v="124","Not-A.Brand";v="99"',
-                "Sec-CH-UA-Mobile":  "?0",
-                "Sec-CH-UA-Platform": '"Windows"',
-                "DNT": "1",
-            },
+            extra_http_headers=extra_headers,
         )
         self._ctx.add_init_script(_STEALTH_JS)
         self.page = self._ctx.new_page()
-        return self
+        self._dead = False
 
-    def __exit__(self, *_):
+    def _shutdown(self):
+        """Tear down the playwright stack silently."""
         for obj, method in [(self.page,"close"),(self._ctx,"close"),
                             (self._brow,"close"),(self._pw,"stop")]:
             if obj:
-                try:
-                    getattr(obj, method)()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass  # EPIPE / broken pipe — Playwright pipe already gone, safe to ignore
-                except Exception:
-                    pass
+                try:   getattr(obj, method)()
+                except Exception: pass
         self.page = self._brow = self._ctx = self._pw = None
 
+    def __exit__(self, *_):
+        self._shutdown()
+
+    def _is_crash(self, exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(sig in msg for sig in self._CRASH_MSGS)
+
+    def _restart(self):
+        """Shut down current browser and launch a fresh one."""
+        log.warning("Chromium crashed — restarting browser…")
+        self._shutdown()
+        try:
+            time.sleep(1.5)   # brief pause before relaunch
+            self._launch()
+            return True
+        except Exception as e:
+            log.error(f"Browser restart failed: {e}")
+            self._dead = True
+            return False
+
     def get_page(self, url, wait="domcontentloaded", retries=2):
+        if self._dead:
+            return None
         for attempt in range(retries + 1):
             try:
-                self.page.goto(url, wait_until=wait, timeout=30_000)
+                self.page.goto(url, wait_until=wait, timeout=12_000)
                 time.sleep(random.uniform(0.2, 0.6))
                 return BeautifulSoup(self.page.content(), "html.parser")
             except PWTimeout:
@@ -117,12 +177,25 @@ class _ThreadBrowser:
                 if attempt == retries: return None
                 time.sleep(2)
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                log.warning(f"EPIPE/pipe error fetching {url} — browser closed: {e}")
+                log.warning(f"Pipe error fetching {url}: {e}")
+                # Attempt browser restart once
+                if attempt == 0 and self._restart():
+                    continue   # retry with fresh browser
                 return None
             except Exception as e:
-                log.warning(f"GET {url}: {e}"); return None
+                if self._is_crash(e):
+                    log.warning(f"Browser crash on {url}: {e}")
+                    # One restart attempt
+                    if attempt == 0 and self._restart():
+                        continue   # retry with fresh browser
+                    return None
+                log.warning(f"GET {url}: {e}")
+                return None
+        return None
 
     def fetch_json(self, url):
+        if self._dead:
+            return None
         try:
             return self.page.evaluate(f"""
                 async () => {{
@@ -137,13 +210,29 @@ class _ThreadBrowser:
                 }}
             """)
         except Exception as e:
-            log.warning(f"fetch_json {url}: {e}"); return None
+            if self._is_crash(e):
+                log.warning(f"Browser crash on fetch_json {url}: {e}")
+                self._restart()
+            else:
+                log.warning(f"fetch_json {url}: {e}")
+            return None
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
-def _delay(lo=0.8, hi=2.2):
+def _delay(lo=0.3, hi=0.9):
     time.sleep(random.uniform(lo, hi))
+
+def _dns_ok(url):
+    """Return True if the host resolves within 2 s. Skips dead sites instantly."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        socket.setdefaulttimeout(2)
+        socket.gethostbyname(host)
+        return True
+    except Exception:
+        return False
 
 
 def _usd(text, src="usd"):
@@ -159,21 +248,168 @@ def _usd(text, src="usd"):
     return r if r > 0 else None
 
 
-def _infer_cat_name(name, desc):
-    t = (name + " " + desc).lower()
-    if any(w in t for w in ["onesie","romper","bodysuit","snap crotch"]): return "Onesies / Rompers"
-    if any(w in t for w in ["pacifier","dummy","soother","paci"]):        return "Pacifiers"
-    if any(w in t for w in ["bottle","sippy"]):                           return "Bottles"
-    if any(w in t for w in ["booster","insert","stuffer","doubler"]):     return "Booster Pads"
-    if any(w in t for w in ["underpad","chux","bed pad","chair pad"]):    return "Underpads / Chux"
-    if any(w in t for w in ["pull-up","pullup","training pant"]):         return "Pull-Ups / Training"
-    if any(w in t for w in ["swim","aqua"]):                              return "Swim Diapers"
-    if any(w in t for w in ["mattress","waterproof cover"]):              return "Bedding / Mattress"
-    if any(w in t for w in ["wipe","barrier cream","rash cream","powder"]):return "Skincare / Medical"
-    if any(w in t for w in ["plastic pant","diaper cover"]):              return "Clothing"
-    if any(w in t for w in ["diaper","nappy","brief","pant","incontinence"]):
-        if any(w in t for w in ["print","design","cute","crinkle","abdl","baby"]): return "ABDL Diapers"
+def _infer_cat_name(name, desc=""):
+    """
+    Infer the product category from name + description.
+    Covers all ABDL, age regression, and incontinence product types.
+    """
+    t = (name + " " + (desc or "")).lower()
+
+    # ── Clothing — check before diapers to avoid misclassification ──────────
+    if any(w in t for w in ["footed sleeper","footie","footies","footed pajama",
+                             "footed pyjama","footed romper","sleepsuit"]):
+        return "Footed Sleepers"
+    if any(w in t for w in ["onesie","snap crotch","bodysuit","romper","playsuit",
+                             "snap bottom","popper crotch","button crotch"]):
+        return "Onesies / Rompers"
+    if any(w in t for w in ["shortall","shortalls","overall","overalls","dungaree"]):
+        return "Overalls / Shortalls"
+    if any(w in t for w in ["bib overall","bib shortall"]):
+        return "Overalls / Shortalls"
+    if any(w in t for w in ["plastic pant","plastic pants","pvc pant","vinyl pant",
+                             "rubber pant","waterproof pant","diaper cover",
+                             "diaper wrap","pul cover","waterproof cover",
+                             "diaper pants","nappy cover","nappy pant"]):
+        return "Plastic Pants / Covers"
+    if any(w in t for w in ["bib","drool bib","bandana bib"]):
+        return "Bibs"
+    if any(w in t for w in ["bonnet","baby hat","baby cap","lace cap",
+                             "frilly hat","christening hat"]):
+        return "Bonnets / Headwear"
+    if any(w in t for w in ["mitten","mittens","baby mitt","scratch mitt"]):
+        return "Mittens"
+    if any(w in t for w in ["baby dress","lolita dress","frilly dress",
+                             "pinafore","smock","babydoll dress"]):
+        return "Dresses / Skirts"
+    if any(w in t for w in ["baby shorts","frilly shorts","rhumba shorts",
+                             "diaper shirt","play shorts"]):
+        return "Baby Clothing"
+    if any(w in t for w in ["onesie set","layette","outfit set","baby set",
+                             "clothing set","bundle set"]):
+        return "Clothing Sets"
+
+    # ── Feeding / Oral ────────────────────────────────────────────────────────
+    if any(w in t for w in ["pacifier","dummy","soother","paci ",
+                             "pacifier clip","paci clip","soother clip",
+                             "binky","wubbanub"]):
+        return "Pacifiers"
+    if any(w in t for w in ["baby bottle","infant bottle","sippy cup",
+                             "sippy","straw cup","training cup","bottle nipple",
+                             "bottle teat","bottle brush"]):
+        return "Bottles / Sippy Cups"
+
+    # ── Furniture / Gear ──────────────────────────────────────────────────────
+    if any(w in t for w in ["adult crib","adult high chair","adult playpen",
+                             "changing table","adult changing table"]):
+        return "Furniture"
+    if any(w in t for w in ["diaper bag","changing bag","nappy bag",
+                             "wet bag","dry bag"]):
+        return "Diaper Bags"
+    if any(w in t for w in ["changing mat","changing pad","changing station",
+                             "portable changing","travel changing"]):
+        return "Changing Accessories"
+
+    # ── Bedding ──────────────────────────────────────────────────────────────
+    if any(w in t for w in ["mattress protector","mattress cover",
+                             "waterproof sheet","waterproof mattress",
+                             "incontinence sheet","mattress"]):
+        return "Bedding / Mattress"
+    if any(w in t for w in ["underpad","chux","chux pad","underpads",
+                             "absorbent pad","chair pad","seat pad",
+                             "bed pad","bed pad"]):   # bed pad → underpads, not bedding
+        return "Underpads / Chux"
+    if any(w in t for w in ["blanket","swaddle","comforter","duvet",
+                             "muslin blanket","fleece blanket","baby blanket"]):
+        return "Blankets"
+
+    # ── Toys / Activities ─────────────────────────────────────────────────────
+    if any(w in t for w in ["plush","stuffed animal","stuffed toy","plushie",
+                             "stuffy","plushies","teddy bear","teddy","cuddly toy",
+                             "stuffie","soft toy","kawaii plush"]):
+        return "Plushies / Stuffed Animals"
+    if any(w in t for w in ["coloring book","colouring book","activity book",
+                             "sticker book","coloring page","paint by",
+                             "color by","crayons","colored pencil",
+                             "washable marker","art set","craft kit",
+                             "activity set","puzzle","jigsaw"]):
+        return "Activity / Crafts"
+    if any(w in t for w in ["rattle","teether","teething","sensory toy",
+                             "baby toy","stacking","building block",
+                             "musical toy","bath toy","squeeze toy"]):
+        return "Toys"
+    if any(w in t for w in ["sticker","stickers","reward sticker",
+                             "potty sticker","chart sticker"]):
+        return "Stickers"
+
+    # ── Booster / Insert ─────────────────────────────────────────────────────
+    if any(w in t for w in ["booster","insert","stuffer","doubler",
+                             "soaker","liner","diaper insert",
+                             "hemp insert","bamboo insert","prefold"]):
+        return "Boosters / Inserts"
+
+    # ── Pull-Ups / Training ──────────────────────────────────────────────────
+    if any(w in t for w in ["pull-up","pull up","pullup","training pant",
+                             "training underwear","learning pant",
+                             "potty training","disposable training"]):
+        return "Pull-Ups / Training"
+
+    # ── Swim ─────────────────────────────────────────────────────────────────
+    if any(w in t for w in ["swim diaper","swim pant","aqua diaper",
+                             "reusable swim","disposable swim",
+                             "swimming pant"]):
+        return "Swim Diapers"
+
+    # ── Skincare / Medical ────────────────────────────────────────────────────
+    if any(w in t for w in ["diaper rash","rash cream","barrier cream",
+                             "zinc oxide","lanolin","baby powder",
+                             "cornstarch powder","talc","petroleum jelly",
+                             "skin protectant","lotion","baby lotion",
+                             "wipe","baby wipe","sensitive wipe",
+                             "cleansing wipe","flushable wipe"]):
+        return "Skincare / Medical"
+
+    # ── Diapers — most specific first ─────────────────────────────────────────
+    if any(w in t for w in ["cloth diaper","cloth nappy","flat diaper",
+                             "prefold diaper","all-in-one diaper","aio diaper",
+                             "pocket diaper","hybrid diaper","fitted diaper"]):
+        return "Cloth Diapers"
+    if any(w in t for w in ["overnight diaper","night diaper","overnight brief",
+                             "overnight nappy","night nappy"]):
+        if any(w in t for w in ["print","cute","crinkle","abdl","baby","kawaii"]):
+            return "ABDL Diapers"
+        return "Overnight Diapers"
+    if any(w in t for w in ["diaper","nappy","incontinence brief",
+                             "adult brief","tab brief","all-in-one brief",
+                             "disposable brief","briefs","adult briefs",
+                             "incontinence briefs"]):
+        if any(w in t for w in ["print","design","cute","crinkle","abdl","baby",
+                                 "kawaii","character","cartoon","printed","pattern",
+                                 "space","castle","safari","galaxy","cloud",
+                                 "paw","bear","bunny","duck","star","heart",
+                                 "tykables","abu ","abuniverse","rearz","bambino",
+                                 "fabine","trest","snuggies","cuddlz","jajo",
+                                 "dotty","incontrol","crinklez"]):
+            return "ABDL Diapers"
+        if any(w in t for w in ["incontinence","medical","moderate","light",
+                                  "absorbency level","maximum","maximum capacity",
+                                  "maximum absorbency","ultra absorbent",
+                                  "extra absorbent","heavy duty","heavy-duty",
+                                  "northshore","prevail","attends","abena",
+                                  "tena","tranquility","unique wellness",
+                                  "seni","hartmann","mega max"]):
+            return "Medical / Incontinence Diapers"
         return "Diapers"
+
+    # ── Accessories / Misc ────────────────────────────────────────────────────
+    if any(w in t for w in ["gift card","gift wrap","gift set"]):
+        return "Gift Cards / Sets"
+    if any(w in t for w in ["sample pack","trial pack","taster pack",
+                             "starter kit","variety pack"]):
+        return "Sample Packs"
+    if any(w in t for w in ["diaper pail","wet pail","disposal",
+                             "disposal bag","odor bag"]):
+        return "Disposal / Storage"
+
     return "Accessories"
 
 
@@ -214,23 +450,69 @@ def _shopify(tb, root, brand_name, site, pcb=None, cur="usd", btype="abdl", disc
             desc  = BeautifulSoup(desc_raw,"html.parser").get_text(" ",strip=True)
             tags  = ", ".join(item.get("tags",[]))
             purl  = f"{root}/products/{item.get('handle','')}"
-            img   = (item.get("images") or [{}])[0].get("src","")
+
+            # Collect ALL images from the Shopify JSON API
+            all_imgs = [img.get("src","") for img in (item.get("images") or []) if img.get("src")]
+            # Strip CDN query strings for clean storage
+            all_imgs = [u.split("?")[0] for u in all_imgs if u]
+
+            # Also check featured_image (some Shopify themes put it there instead)
+            if not all_imgs:
+                fi = item.get("featured_image") or {}
+                if isinstance(fi, dict) and fi.get("src"):
+                    all_imgs = [fi["src"].split("?")[0]]
+                elif isinstance(fi, str) and fi:
+                    all_imgs = [fi.split("?")[0]]
+
+            # Last resort: fetch the product page and scrape the og:image / main img
+            if not all_imgs and purl:
+                try:
+                    ps = tb.get_page(purl, wait="domcontentloaded")
+                    if ps:
+                        # Try og:image meta first (most reliable)
+                        og = ps.select_one('meta[property="og:image"]')
+                        if og and og.get("content"):
+                            all_imgs = [og["content"].split("?")[0]]
+                        else:
+                            # Try product gallery images
+                            for sel in [
+                                ".product__media img", ".product-single__media img",
+                                ".product-featured-media img", ".product-photo-container img",
+                                ".woocommerce-product-gallery__image img",
+                                'img[class*="product"]', 'img[id*="product"]',
+                                ".product img", "main img",
+                            ]:
+                                el = ps.select_one(sel)
+                                if el:
+                                    src = (el.get("src") or el.get("data-src") or
+                                           el.get("data-srcset","").split()[0])
+                                    if src and not src.endswith(".svg"):
+                                        full = src if src.startswith("http") else urljoin(purl, src)
+                                        all_imgs = [full.split("?")[0]]
+                                        break
+                except Exception:
+                    pass
+
+            img = all_imgs[0] if all_imgs else ""
+
             price = None
             if item.get("variants"):
                 price = _usd(str(item["variants"][0].get("price","")), cur)
+
             products.append({"name":title,"brand_name":brand_name,
                 "category_name":_infer_cat_name(title,desc),"description":desc[:1200],
-                "url":purl,"image_url":img,"price_usd":price,"price":price,"currency":"USD",
+                "url":purl,"image_url":img,"extra_images":all_imgs[1:],
+                "price_usd":price,"price":price,"currency":"USD",
                 "absorbency_ml":_abs_ml(desc),"tags":tags,"source_site":site,
                 "brand_type":btype,"discreet_shipping":disc,"free_sample":samp,"in_stock":1})
-            if pcb: pcb(f"  Found: {title[:55]}")
-        page_n += 1; _delay(0.6, 1.5)
+            if pcb: pcb(f"  Found: {title[:55]} ({len(all_imgs)} image{'s' if len(all_imgs)!=1 else ''})")
+        page_n += 1; _delay(0.2, 0.6)
     return products
 
 
 def _html(tb, site_url, brand_name, site, sels, pcb=None, cur="usd", btype="abdl", disc=0, samp=0):
     products = []
-    soup = tb.get_page(site_url, wait="networkidle")
+    soup = tb.get_page(site_url, wait="domcontentloaded")
     if not soup: return products
     lf = sels.get("link_filter","/product")
     links = []
@@ -262,20 +544,50 @@ def _html(tb, site_url, brand_name, site, sels, pcb=None, cur="usd", btype="abdl
                     price = _usd(el.get_text(), cur)
                     if price: break
         img = ""
-        for s in [sels.get("image"),".woocommerce-product-gallery__image img",
-                  ".product-image img","img.wp-post-image"]:
-            if s:
+        # Broad selector list: og:image (most reliable) → gallery → generic
+        og = ps.select_one('meta[property="og:image"]')
+        if og and og.get("content"):
+            img = og["content"].split("?")[0]
+        else:
+            for s in [
+                sels.get("image"),
+                # WooCommerce
+                ".woocommerce-product-gallery__image img",
+                ".woocommerce-product-gallery img",
+                "img.wp-post-image",
+                # Shopify
+                ".product__media img",
+                ".product-single__media img",
+                ".product-featured-media img",
+                ".product-photo-container img",
+                # Generic
+                ".product-image img",
+                ".product__image img",
+                'img[class*="product-img"]',
+                'img[class*="product_img"]',
+                'img[id*="product-img"]',
+                ".product img",
+                "article img",
+                "main img",
+            ]:
+                if not s:
+                    continue
                 el = ps.select_one(s)
                 if el:
-                    src = el.get("src") or el.get("data-src","")
-                    if src: img = urljoin(purl, src); break
+                    src = (el.get("src") or el.get("data-src") or
+                           el.get("data-lazy-src") or
+                           (el.get("data-srcset","") or "").split()[0])
+                    if src and not src.endswith(".svg") and "placeholder" not in src.lower():
+                        img = (src if src.startswith("http") else urljoin(purl, src)).split("?")[0]
+                        break
         if title:
             products.append({"name":title,"brand_name":brand_name,
                 "category_name":_infer_cat_name(title,desc),"description":desc,
-                "url":purl,"image_url":img,"price_usd":price,"price":price,"currency":"USD",
+                "url":purl,"image_url":img,"extra_images":[],
+                "price_usd":price,"price":price,"currency":"USD",
                 "source_site":site,"brand_type":btype,"discreet_shipping":disc,
                 "free_sample":samp,"in_stock":1})
-            if pcb: pcb(f"  Found: {title[:55]}")
+            if pcb: pcb(f"  Found: {title[:55]}{' 🖼' if img else ''}")
     return products
 
 
@@ -314,468 +626,6 @@ def _crinklz(tb, brand_name, site, pcb=None):
     return products
 
 
-
-# ── Walmart scraper ───────────────────────────────────────────────────────────
-def _walmart(tb, search_url, site, pcb=None):
-    """
-    Scrape Walmart baby/incontinence category pages.
-    Uses Walmart's internal __NEXT_DATA__ JSON blob embedded in the page.
-    Falls back to HTML card parsing if JSON not found.
-    """
-    products = []; seen = set()
-    base = "https://www.walmart.com"
-
-    def _extract_page(soup, url):
-        found = []
-        # Try __NEXT_DATA__ JSON first (most reliable)
-        nd = soup.find("script", {"id": "__NEXT_DATA__"})
-        if nd:
-            try:
-                data = json.loads(nd.string or "")
-                items = (data.get("props",{}).get("pageProps",{})
-                             .get("initialData",{}).get("searchResult",{})
-                             .get("itemStacks",[{}])[0].get("items",[]))
-                if not items:
-                    # category page structure
-                    items = (data.get("props",{}).get("pageProps",{})
-                                 .get("initialData",{}).get("contentLayout",{})
-                                 .get("modules",[{}])[0].get("configs",{})
-                                 .get("products",[]))
-                for it in items:
-                    name  = it.get("name") or it.get("title","")
-                    price = None
-                    pc = it.get("price") or it.get("priceInfo",{})
-                    if isinstance(pc, dict):
-                        price = _usd(str(pc.get("currentPrice") or pc.get("minPrice") or ""), "usd")
-                    elif pc:
-                        price = _usd(str(pc), "usd")
-                    pid   = it.get("usItemId") or it.get("id","")
-                    purl  = f"{base}/ip/{pid}" if pid else url
-                    img   = it.get("image","") or it.get("imageInfo",{}).get("thumbnailUrl","")
-                    desc  = it.get("shortDescription","") or it.get("description","")
-                    if isinstance(desc, list): desc = " ".join(desc)
-                    brand = it.get("brand","") or it.get("sellerName","")
-                    if name and name not in seen:
-                        seen.add(name)
-                        found.append({"name": name, "brand_name": brand,
-                            "category_name": _infer_cat_name(name, str(desc)),
-                            "description": str(desc)[:800], "url": purl,
-                            "image_url": img, "price_usd": price, "price": price,
-                            "currency": "USD", "source_site": site,
-                            "brand_type": "medical", "discreet_shipping": 1,
-                            "free_sample": 0, "in_stock": 1})
-                        if pcb and name: pcb(f"  Found: {name[:55]}")
-            except Exception as e:
-                log.debug(f"Walmart JSON parse: {e}")
-
-        # HTML card fallback
-        if not found:
-            for card in soup.select('[data-item-id],[data-product-id],[class*="product-title"]')[:60]:
-                name_el = card.select_one('[class*="product-title"] span, [class*="name"] span, h2, h3')
-                if not name_el: continue
-                name = name_el.get_text(strip=True)
-                if not name or name in seen: continue
-                price_el = card.select_one('[class*="price"] span, [itemprop="price"]')
-                price = _usd(price_el.get_text(), "usd") if price_el else None
-                a_el = card.select_one('a[href*="/ip/"]')
-                purl = urljoin(base, a_el["href"]) if a_el and a_el.get("href") else url
-                img_el = card.select_one("img[src]")
-                img = img_el.get("src","") if img_el else ""
-                seen.add(name)
-                found.append({"name": name, "brand_name": "",
-                    "category_name": _infer_cat_name(name,""),
-                    "description": "", "url": purl, "image_url": img,
-                    "price_usd": price, "price": price, "currency": "USD",
-                    "source_site": site, "brand_type": "medical",
-                    "discreet_shipping": 1, "free_sample": 0, "in_stock": 1})
-                if pcb: pcb(f"  Found: {name[:55]}")
-        return found
-
-    # Scrape up to 4 pages
-    for page in range(1, 5):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}page={page}&affinityOverride=default" if page > 1 else search_url
-        soup = tb.get_page(url, "networkidle")
-        if not soup: break
-        batch = _extract_page(soup, url)
-        if not batch: break
-        products.extend(batch)
-        _delay(1.5, 3.0)
-        if len(products) >= 120: break
-
-    return products
-
-
-# ── Target scraper ────────────────────────────────────────────────────────────
-def _target(tb, search_url, site, pcb=None):
-    """
-    Scrape Target category / search pages.
-    Target embeds product data in <script type="application/ld+json"> and
-    __TGT_DATA__ / window.__PRELOADED_QUERIES__ blobs.
-    """
-    products = []; seen = set()
-    base = "https://www.target.com"
-
-    def _parse_target(soup, url):
-        found = []
-        # Try ld+json product listings
-        for sc in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(sc.string or "")
-                if not isinstance(data, list): data = [data]
-                for item in data:
-                    if item.get("@type") not in ("Product","ItemList"): continue
-                    if item.get("@type") == "ItemList":
-                        for el in item.get("itemListElement",[]):
-                            item2 = el.get("item",{})
-                            name = item2.get("name","")
-                            if not name or name in seen: continue
-                            seen.add(name)
-                            offer = (item2.get("offers") or [{}])
-                            if isinstance(offer, dict): offer = [offer]
-                            price = _usd(str(offer[0].get("price","") if offer else ""), "usd")
-                            purl  = item2.get("url", url)
-                            img   = (item2.get("image") or [""])[0] if isinstance(item2.get("image"), list) else item2.get("image","")
-                            brand = item2.get("brand",{}).get("name","") if isinstance(item2.get("brand"),dict) else ""
-                            found.append({"name":name,"brand_name":brand,
-                                "category_name":_infer_cat_name(name,""),
-                                "description":"","url":purl,"image_url":img,
-                                "price_usd":price,"price":price,"currency":"USD",
-                                "source_site":site,"brand_type":"medical",
-                                "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                            if pcb: pcb(f"  Found: {name[:55]}")
-            except Exception: pass
-
-        # HTML card fallback
-        if not found:
-            for card in soup.select('[data-test="product-details"],[class*="ProductCardImage"]')[:60]:
-                name_el = card.select_one('[data-test*="product-title"] a, a[href*="/p/"]')
-                if not name_el: continue
-                name = name_el.get_text(strip=True) or name_el.get("aria-label","")
-                if not name or name in seen: continue
-                seen.add(name)
-                price_el = card.select_one('[data-test*="current-price"] span,[class*="Price"]')
-                price = _usd(price_el.get_text(), "usd") if price_el else None
-                href  = name_el.get("href","")
-                purl  = urljoin(base, href) if href else url
-                img_el = card.select_one("img[src]")
-                img   = img_el.get("src","") if img_el else ""
-                found.append({"name":name,"brand_name":"",
-                    "category_name":_infer_cat_name(name,""),
-                    "description":"","url":purl,"image_url":img,
-                    "price_usd":price,"price":price,"currency":"USD",
-                    "source_site":site,"brand_type":"medical",
-                    "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                if pcb: pcb(f"  Found: {name[:55]}")
-        return found
-
-    for page in range(1, 5):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}Nao={24*(page-1)}" if page > 1 else search_url
-        soup = tb.get_page(url, "networkidle")
-        if not soup: break
-        batch = _parse_target(soup, url)
-        if not batch: break
-        products.extend(batch)
-        _delay(1.5, 3.0)
-        if len(products) >= 120: break
-
-    return products
-
-
-# ── Amazon scraper ────────────────────────────────────────────────────────────
-def _amazon(tb, search_url, site, pcb=None):
-    """
-    Scrape Amazon search/category pages.
-    Amazon embeds product data in div[data-asin] cards.
-    """
-    products = []; seen = set()
-    base = "https://www.amazon.com"
-
-    for page in range(1, 4):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}page={page}" if page > 1 else search_url
-        soup = tb.get_page(url, "networkidle")
-        if not soup: break
-        found_this = 0
-        for card in soup.select("[data-asin][data-asin!='']")[:50]:
-            asin  = card.get("data-asin","")
-            name_el = card.select_one("h2 a span, h2 span, [class*='title'] span")
-            if not name_el: continue
-            name = name_el.get_text(strip=True)
-            if not name or name in seen: continue
-            seen.add(name); found_this += 1
-            price_el = card.select_one(".a-price .a-offscreen, .a-color-price")
-            price = _usd(price_el.get_text(), "usd") if price_el else None
-            a_el = card.select_one("h2 a[href], a.a-link-normal[href*='/dp/']")
-            href = a_el.get("href","") if a_el else ""
-            purl = urljoin(base, href) if href else f"{base}/dp/{asin}"
-            img_el = card.select_one("img.s-image,[class*='product-image'] img")
-            img  = img_el.get("src","") if img_el else ""
-            products.append({"name":name,"brand_name":"",
-                "category_name":_infer_cat_name(name,""),
-                "description":"","url":purl,"image_url":img,
-                "price_usd":price,"price":price,"currency":"USD",
-                "source_site":site,"brand_type":"medical",
-                "discreet_shipping":1,"free_sample":0,"in_stock":1})
-            if pcb: pcb(f"  Found: {name[:55]}")
-        if not found_this: break
-        _delay(2.0, 4.0)
-        if len(products) >= 100: break
-
-    return products
-
-
-# ── CVS / Walgreens / Rite Aid scraper ───────────────────────────────────────
-def _pharmacy(tb, search_url, site, pcb=None):
-    """
-    Generic pharmacy chain scraper (CVS, Walgreens, Rite Aid, Dollar General).
-    Handles both JSON-LD and HTML card patterns.
-    """
-    products = []; seen = set()
-    base = "/".join(search_url.split("/")[:3])
-
-    def _parse(soup, url):
-        found = []
-        # JSON-LD
-        for sc in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(sc.string or "")
-                if not isinstance(data, list): data = [data]
-                for item in data:
-                    if item.get("@type") != "Product": continue
-                    name = item.get("name","")
-                    if not name or name in seen: continue
-                    seen.add(name)
-                    offers = item.get("offers",{})
-                    if isinstance(offers, list): offers = offers[0] if offers else {}
-                    price = _usd(str(offers.get("price","")), "usd")
-                    purl  = item.get("url", url)
-                    img   = item.get("image","")
-                    if isinstance(img, list): img = img[0] if img else ""
-                    brand = item.get("brand",{})
-                    brand = brand.get("name","") if isinstance(brand, dict) else str(brand)
-                    found.append({"name":name,"brand_name":brand,
-                        "category_name":_infer_cat_name(name,""),
-                        "description":item.get("description","")[:600],
-                        "url":purl,"image_url":img,
-                        "price_usd":price,"price":price,"currency":"USD",
-                        "source_site":site,"brand_type":"medical",
-                        "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                    if pcb: pcb(f"  Found: {name[:55]}")
-            except Exception: pass
-
-        # HTML cards
-        if not found:
-            selectors = [
-                ("a[class*='product'][href]", "span,h2,h3", ".price,.product-price,[class*='price']"),
-                (".product-list-item a, .product-card a", "h2,h3,[class*='name']", "[class*='price']"),
-                ("[data-product-name],[data-item-name]", None, "[data-price],[class*='price']"),
-            ]
-            for link_sel, name_sel, price_sel in selectors:
-                cards = soup.select(link_sel)[:60]
-                if not cards: continue
-                for card in cards:
-                    if name_sel:
-                        name_el = card.select_one(name_sel) or card
-                        name = name_el.get_text(strip=True)
-                    else:
-                        name = card.get("data-product-name") or card.get("data-item-name","")
-                    if not name or name in seen: continue
-                    seen.add(name)
-                    price_el = card.select_one(price_sel) if price_sel else None
-                    price = _usd(price_el.get_text(), "usd") if price_el else None
-                    href = card.get("href","") if card.name == "a" else (card.select_one("a") or card).get("href","")
-                    purl = urljoin(base, href) if href else url
-                    img_el = card.select_one("img[src]")
-                    img = img_el.get("src","") if img_el else ""
-                    found.append({"name":name,"brand_name":"",
-                        "category_name":_infer_cat_name(name,""),
-                        "description":"","url":purl,"image_url":img,
-                        "price_usd":price,"price":price,"currency":"USD",
-                        "source_site":site,"brand_type":"medical",
-                        "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                    if pcb: pcb(f"  Found: {name[:55]}")
-                if found: break
-        return found
-
-    for page in range(1, 4):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}page={page}" if page > 1 else search_url
-        soup = tb.get_page(url, "networkidle")
-        if not soup: break
-        batch = _parse(soup, url)
-        if not batch: break
-        products.extend(batch)
-        _delay(1.5, 3.0)
-        if len(products) >= 100: break
-
-    return products
-
-
-# ── Dollar General scraper ────────────────────────────────────────────────────
-def _dollar_general(tb, search_url, site, pcb=None):
-    """DG embeds products in window.DGM_PRODUCT_DATA or standard JSON-LD."""
-    products = []; seen = set()
-
-    for page in range(1, 4):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}start={24*(page-1)}" if page > 1 else search_url
-        soup = tb.get_page(url, "networkidle")
-        if not soup: break
-
-        # Try DG's embedded JSON
-        for sc in soup.find_all("script"):
-            txt = sc.string or ""
-            if "DGM_PRODUCT_DATA" in txt or '"@type":"Product"' in txt:
-                # extract JSON array
-                m = re.search(r'\[{"@type".*?"Product".*?\]', txt, re.DOTALL)
-                if m:
-                    try:
-                        items = json.loads(m.group())
-                        for it in items:
-                            name = it.get("name","")
-                            if not name or name in seen: continue
-                            seen.add(name)
-                            offer = it.get("offers",{})
-                            if isinstance(offer,list): offer = offer[0] if offer else {}
-                            price = _usd(str(offer.get("price","")), "usd")
-                            products.append({"name":name,"brand_name":it.get("brand",{}).get("name","") if isinstance(it.get("brand"),dict) else "",
-                                "category_name":_infer_cat_name(name,""),
-                                "description":it.get("description","")[:500],
-                                "url":it.get("url",url),"image_url":it.get("image",""),
-                                "price_usd":price,"price":price,"currency":"USD",
-                                "source_site":site,"brand_type":"medical",
-                                "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                            if pcb: pcb(f"  Found: {name[:55]}")
-                    except Exception: pass
-
-        # HTML fallback
-        if not [p for p in products if p["source_site"]==site]:
-            for card in soup.select("li.product-tile,div.product-tile,[class*='ProductTile']")[:60]:
-                name_el = card.select_one("[class*='product-name'],[class*='title'],h2,h3")
-                if not name_el: continue
-                name = name_el.get_text(strip=True)
-                if not name or name in seen: continue
-                seen.add(name)
-                price_el = card.select_one("[class*='price'],[class*='Price']")
-                price = _usd(price_el.get_text(),"usd") if price_el else None
-                a_el = card.select_one("a[href]")
-                purl = urljoin("https://www.dollargeneral.com", a_el["href"]) if a_el else url
-                img_el = card.select_one("img[src]")
-                img = img_el.get("src","") if img_el else ""
-                products.append({"name":name,"brand_name":"",
-                    "category_name":_infer_cat_name(name,""),
-                    "description":"","url":purl,"image_url":img,
-                    "price_usd":price,"price":price,"currency":"USD",
-                    "source_site":site,"brand_type":"medical",
-                    "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                if pcb: pcb(f"  Found: {name[:55]}")
-        _delay(1.5, 3.0)
-        if len(products) >= 100: break
-
-    return products
-
-
-# ── Buy Buy Baby scraper ──────────────────────────────────────────────────────
-def _buybuy_baby(tb, search_url, site, pcb=None):
-    """BuyBuyBaby (BBBY) uses Bed Bath & Beyond's platform — JSON-LD + HTML cards."""
-    products = []; seen = set()
-    base = "https://www.buybuybaby.com"
-
-    for page in range(1, 4):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}start={24*(page-1)}" if page > 1 else search_url
-        soup = tb.get_page(url, "networkidle")
-        if not soup: break
-
-        # JSON-LD
-        for sc in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(sc.string or "")
-                if not isinstance(data,list): data=[data]
-                for it in data:
-                    if it.get("@type") != "Product": continue
-                    name = it.get("name","")
-                    if not name or name in seen: continue
-                    seen.add(name)
-                    offer = it.get("offers",{})
-                    if isinstance(offer,list): offer=offer[0] if offer else {}
-                    price = _usd(str(offer.get("price","")), "usd")
-                    products.append({"name":name,"brand_name":it.get("brand",{}).get("name","") if isinstance(it.get("brand"),dict) else "",
-                        "category_name":_infer_cat_name(name,it.get("description","")),
-                        "description":it.get("description","")[:600],
-                        "url":it.get("url",url),"image_url":it.get("image",""),
-                        "price_usd":price,"price":price,"currency":"USD",
-                        "source_site":site,"brand_type":"medical",
-                        "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                    if pcb: pcb(f"  Found: {name[:55]}")
-            except Exception: pass
-
-        # HTML fallback
-        if not [p for p in products]:
-            for card in soup.select("[class*='productCard'],[class*='product-card'],li[class*='product']")[:60]:
-                name_el = card.select_one("[class*='productTitle'],[class*='product-title'],h2,h3")
-                if not name_el: continue
-                name = name_el.get_text(strip=True)
-                if not name or name in seen: continue
-                seen.add(name)
-                price_el = card.select_one("[class*='price'],[class*='Price']")
-                price = _usd(price_el.get_text(),"usd") if price_el else None
-                a_el = card.select_one("a[href]")
-                purl = urljoin(base, a_el["href"]) if a_el and a_el.get("href") else url
-                img_el = card.select_one("img[src]")
-                img = img_el.get("src","") if img_el else ""
-                products.append({"name":name,"brand_name":"",
-                    "category_name":_infer_cat_name(name,""),
-                    "description":"","url":purl,"image_url":img,
-                    "price_usd":price,"price":price,"currency":"USD",
-                    "source_site":site,"brand_type":"medical",
-                    "discreet_shipping":1,"free_sample":0,"in_stock":1})
-                if pcb: pcb(f"  Found: {name[:55]}")
-        _delay(1.5, 3.0)
-        if len(products) >= 100: break
-
-    return products
-
-
-# ── Costco scraper ────────────────────────────────────────────────────────────
-def _costco(tb, search_url, site, pcb=None):
-    """Costco uses Endeca/ATG platform. JSON-LD + .product-description divs."""
-    products = []; seen = set()
-    base = "https://www.costco.com"
-
-    for page in range(1, 3):
-        sep = "&" if "?" in search_url else "?"
-        url = f"{search_url}{sep}currentPage={page}" if page > 1 else search_url
-        soup = tb.get_page(url, "networkidle")
-        if not soup: break
-
-        for card in soup.select(".product-list-item,.product-detail,li[class*='product']")[:60]:
-            name_el = card.select_one(".description a,.product-title a,h3 a,h2 a")
-            if not name_el: continue
-            name = name_el.get_text(strip=True)
-            if not name or name in seen: continue
-            seen.add(name)
-            price_el = card.select_one(".price,[class*='price'],[class*='Price']")
-            price = _usd(price_el.get_text(),"usd") if price_el else None
-            href = name_el.get("href","")
-            purl = urljoin(base, href) if href else url
-            img_el = card.select_one("img[src]")
-            img = img_el.get("src","") if img_el else ""
-            products.append({"name":name,"brand_name":"",
-                "category_name":_infer_cat_name(name,""),
-                "description":"","url":purl,"image_url":img,
-                "price_usd":price,"price":price,"currency":"USD",
-                "source_site":site,"brand_type":"medical",
-                "discreet_shipping":0,"free_sample":0,"in_stock":1})
-            if pcb: pcb(f"  Found: {name[:55]}")
-        _delay(2.0, 4.0)
-        if len(products) >= 80: break
-
-    return products
-
-
 BRAND_FLAGS = {
     "tykables":(0,0),"abu/abuniverse":(1,1),"rearz":(1,0),"bambino":(1,1),
     "betterdry":(0,1),"crinklz":(0,1),"little for big":(1,0),
@@ -784,57 +634,129 @@ BRAND_FLAGS = {
 }
 
 PROFILES = {
-    "Tykables Store":         {"type":"shopify","base":"https://tykables.com","brand":"Tykables","currency":"usd","brand_type":"abdl"},
-    "ABUniverse Store":       {"type":"shopify","base":"https://abuniverse.com","brand":"ABU/ABUniverse","currency":"usd","brand_type":"abdl"},
-    "Rearz Store":            {"type":"shopify_probe","brand":"Rearz","currency":"cad","brand_type":"abdl","alt_bases":["https://rearz.ca","https://www.rearz.ca"]},
-    "Little For Big":         {"type":"shopify_probe","brand":"Little For Big","currency":"usd","brand_type":"abdl","alt_bases":["https://www.littleforbig.com"],"fallback_filter":"/products/"},
-    "Bambino Diapers":        {"type":"html","base":"https://bambinodiapers.com/shop","brand":"Bambino","currency":"usd","brand_type":"abdl","selectors":{"product_link":"a.woocommerce-LoopProduct-link","link_filter":"/product/","title":"h1.product_title","description":"div.woocommerce-product-details__short-description","price":"p.price"}},
-    "BetterDry":              {"type":"html","base":"https://www.betterdrydiapers.com","brand":"BetterDry","currency":"eur","brand_type":"abdl","selectors":{"product_link":"a.woocommerce-LoopProduct-link","link_filter":"/product/","title":"h1.product_title","description":"div.woocommerce-product-details__short-description","price":"p.price"}},
-    "Crinklz":                {"type":"custom","fn":"crinklz","brand":"Crinklz","brand_type":"abdl"},
-    "ABDL Factory":           {"type":"shopify_probe","brand":"ABDL Factory","brand_type":"abdl","alt_bases":["https://abdlfactory.com"]},
-    "Fabine":                 {"type":"shopify_probe","brand":"Fabine","currency":"eur","brand_type":"abdl","alt_bases":["https://fabine.de"]},
-    "MyDiaper":               {"type":"shopify_probe","brand":"MyDiaper","currency":"eur","brand_type":"abdl","alt_bases":["https://mydiaper.eu"]},
-    "NorthShore Care Supply": {"type":"shopify_probe","brand":"NorthShore Care","currency":"usd","brand_type":"medical","alt_bases":["https://northshorecare.com","https://www.northshorecare.com"]},
-    "Carewell":               {"type":"shopify_probe","brand":"","currency":"usd","brand_type":"medical","alt_bases":["https://www.carewell.com"]},
-    "Tranquility Products":   {"type":"shopify_probe","brand":"Tranquility","currency":"usd","brand_type":"medical","alt_bases":["https://www.tranquilityproducts.com"]},
-    "Unique Wellness":        {"type":"shopify_probe","brand":"Unique Wellness","currency":"usd","brand_type":"medical","alt_bases":["https://wellnessbriefs.com","https://www.wellnessbriefs.com"]},
-    "Abena USA":              {"type":"shopify_probe","brand":"Abena","currency":"usd","brand_type":"both","alt_bases":["https://www.abenausa.com"]},
-    "Adult Diaper Superstore":{"type":"shopify_probe","brand":"","currency":"usd","brand_type":"medical","alt_bases":["https://www.adultdiapersuperstore.com"]},
-    "DiapersEtc":             {"type":"shopify_probe","brand":"","currency":"usd","brand_type":"medical","alt_bases":["https://www.diapersetc.com"]},
-    "Parentgiving":           {"type":"shopify_probe","brand":"","currency":"usd","brand_type":"medical","alt_bases":["https://www.parentgiving.com"]},
-    "XP Medical":             {"type":"shopify_probe","brand":"","currency":"usd","brand_type":"medical","alt_bases":["https://www.xpmedical.com","https://xpmedical.com"]},
-    "HDIS":                   {"type":"html","base":"https://www.hdis.com/incontinence","brand":"","currency":"usd","brand_type":"medical","selectors":{"product_link":"a[href*='/incontinence/']","link_filter":"/incontinence/","title":"h1","price":".price,.product-price"}},
-    "Vitality Medical":       {"type":"html","base":"https://www.vitalitymedical.com/briefs.html","brand":"","currency":"usd","brand_type":"medical","selectors":{"product_link":"a[href*='vitalitymedical.com'][href*='.html']","link_filter":"vitalitymedical.com","title":"h1","price":".price,.our-price"}},
-    "Personally Delivered":   {"type":"html","base":"https://www.personallydelivered.com/adult-diapers","brand":"","currency":"usd","brand_type":"medical","selectors":{"product_link":"a.product-item-name","link_filter":"/product","title":"h1.page-title","price":".price"}},
-    "Health Products For You":{"type":"html","base":"https://www.healthproductsforyou.com/c-adult-diapers.html","brand":"","currency":"usd","brand_type":"medical","selectors":{"product_link":"a.product-name","link_filter":"/p-","title":"h1","price":".our-price"}},
-
-    # ── Mainstream retail — baby / incontinence sections ──────────────────────
-    # Walmart baby products category + incontinence + diapers for adults
-    "Walmart Baby":           {"type":"walmart","url":"https://www.walmart.com/cp/baby-products/5427","brand":"","currency":"usd","brand_type":"medical"},
-    "Walmart Incontinence":   {"type":"walmart","url":"https://www.walmart.com/cp/incontinence/1101660","brand":"","currency":"usd","brand_type":"medical"},
-    "Walmart Adult Diapers":  {"type":"walmart","url":"https://www.walmart.com/search?q=adult+diapers","brand":"","currency":"usd","brand_type":"medical"},
-
-    # Target baby section + adult care
-    "Target Baby":            {"type":"target","url":"https://www.target.com/c/baby/-/N-5xsx0","brand":"","currency":"usd","brand_type":"medical"},
-    "Target Adult Care":      {"type":"target","url":"https://www.target.com/c/incontinence-care-adult/-/N-5xu1u","brand":"","currency":"usd","brand_type":"medical"},
-    "Target Diapers":         {"type":"target","url":"https://www.target.com/s?searchTerm=adult+diapers","brand":"","currency":"usd","brand_type":"medical"},
-
-    # Amazon baby/incontinence
-    "Amazon Baby Diapers":    {"type":"amazon","url":"https://www.amazon.com/s?k=adult+diapers+large&rh=n%3A3760901","brand":"","currency":"usd","brand_type":"medical"},
-    "Amazon Baby Products":   {"type":"amazon","url":"https://www.amazon.com/s?k=baby+diapers+onesie+accessories&rh=n%3A165796011","brand":"","currency":"usd","brand_type":"medical"},
-    "Amazon ABDL":            {"type":"amazon","url":"https://www.amazon.com/s?k=ABDL+diapers+adult+baby","brand":"","currency":"usd","brand_type":"abdl"},
-
-    # Pharmacy chains — incontinence / adult care aisles
-    "CVS Baby & Adult Care":  {"type":"pharmacy","url":"https://www.cvs.com/shop/incontinence","brand":"","currency":"usd","brand_type":"medical"},
-    "Walgreens Incontinence": {"type":"pharmacy","url":"https://www.walgreens.com/store/c/incontinence/ID=361607-tier2","brand":"","currency":"usd","brand_type":"medical"},
-    "Rite Aid Baby & Adult":  {"type":"pharmacy","url":"https://www.riteaid.com/shop/baby-incontinence/incontinence","brand":"","currency":"usd","brand_type":"medical"},
-
-    # Dollar stores & club stores
-    "Dollar General Baby":    {"type":"dollar_general","url":"https://www.dollargeneral.com/category/baby-diapers-training-pants.html","brand":"","currency":"usd","brand_type":"medical"},
-    "Costco Diapers":         {"type":"costco","url":"https://www.costco.com/adult-incontinence.html","brand":"","currency":"usd","brand_type":"medical"},
-
-    # Specialty baby stores
-    "Buy Buy Baby":           {"type":"buybuy_baby","url":"https://www.buybuybaby.com/store/s/diaper","brand":"","currency":"usd","brand_type":"medical"},
+    # ── ABDL Specialty ────────────────────────────────────────────────
+    "Tykables Store":       {"type":"shopify",       "base":"https://tykables.com",             "brand":"Tykables",       "currency":"usd","brand_type":"abdl"},
+    "ABUniverse Store":     {"type":"shopify",       "base":"https://abuniverse.com",           "brand":"ABU/ABUniverse", "currency":"usd","brand_type":"abdl"},
+    "Rearz Store":          {"type":"shopify_probe", "brand":"Rearz",          "currency":"cad","brand_type":"abdl",
+                             "alt_bases":["https://rearz.ca","https://www.rearz.ca"]},
+    "Bambino Diapers":      {"type":"html",          "base":"https://bambinodiapers.com/shop",  "brand":"Bambino",        "currency":"usd","brand_type":"abdl",
+                             "selectors":{"product_link":"a.woocommerce-LoopProduct-link","link_filter":"/product/",
+                                          "title":"h1.product_title","description":"div.woocommerce-product-details__short-description","price":"p.price"}},
+    "BetterDry":            {"type":"html",          "base":"https://www.betterdrydiapers.com", "brand":"BetterDry",      "currency":"eur","brand_type":"abdl",
+                             "selectors":{"product_link":"a.woocommerce-LoopProduct-link","link_filter":"/product/",
+                                          "title":"h1.product_title","description":"div.woocommerce-product-details__short-description","price":"p.price"}},
+    "Crinklz":              {"type":"custom",        "fn":"crinklz",           "brand":"Crinklz",        "brand_type":"abdl"},
+    "Little For Big":       {"type":"shopify_probe", "brand":"Little For Big", "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://www.littleforbig.com"],"fallback_filter":"/products/"},
+    "ABDL Factory":         {"type":"shopify_probe", "brand":"ABDL Factory",   "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://abdlfactory.com","https://www.abdlfactory.com"]},
+    "Fabine":               {"type":"shopify_probe", "brand":"Fabine",         "currency":"eur","brand_type":"abdl",
+                             "alt_bases":["https://fabine.de","https://www.fabine.de"]},
+    "MyDiaper":             {"type":"html",          "base":"https://mydiaper.eu",              "brand":"MyDiaper",       "currency":"eur","brand_type":"abdl",
+                             "selectors":{"product_link":"a.woocommerce-LoopProduct-link","link_filter":"/product/",
+                                          "title":"h1.product_title","price":"p.price"}},
+    "InControl Designs":    {"type":"shopify_probe", "brand":"InControl",      "currency":"usd","brand_type":"abdl",
+                             "disabled": True,  # ERR_CONNECTION_CLOSED every session since 2026-03-19 — site down
+                             "alt_bases":["https://www.incontroldesigns.com","https://incontroldesigns.com"]},
+    "Snuggies AU":          {"type":"shopify_probe", "brand":"Snuggies",       "currency":"aud","brand_type":"abdl",
+                             "alt_bases":["https://snuggies.com.au","https://www.snuggies.com.au"]},
+    "NappiesRus":           {"type":"shopify_probe", "brand":"",               "currency":"gbp","brand_type":"abdl",
+                             "alt_bases":["https://www.nappiesrus.co.uk","https://nappiesrus.co.uk"]},
+    "Cuddlz":               {"type":"html",          "base":"https://www.cuddlz.com/shop",      "brand":"Cuddlz",         "currency":"gbp","brand_type":"abdl",
+                             "selectors":{"product_link":"a.woocommerce-LoopProduct-link","link_filter":"/product/",
+                                          "title":"h1.product_title","price":"p.price"}},
+    "TNT Diaper Store":     {"type":"shopify_probe", "brand":"",               "currency":"eur","brand_type":"abdl",
+                             "alt_bases":["https://www.tntdiaper.com","https://tntdiaper.com"]},
+    "ABUniverse EU":        {"type":"shopify",       "base":"https://eu.abuniverse.com",        "brand":"ABU/ABUniverse", "currency":"eur","brand_type":"abdl"},
+    "Diaper Bros":          {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://www.diaperbroshop.com","https://diaperbroshop.com"]},
+    "PeekABU":              {"type":"shopify_probe", "brand":"PeekABU",        "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://www.peekabu.com","https://peekabu.com"]},
+    # Newly added ABDL stores
+    "Trest":                {"type":"shopify_probe", "brand":"Trest",          "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://trest.com","https://www.trest.com"]},
+    "Wearing Clouds":       {"type":"shopify_probe", "brand":"Wearing Clouds", "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://wearingclouds.com","https://www.wearingclouds.com"]},
+    "Babykins":             {"type":"shopify_probe", "brand":"Babykins",       "currency":"cad","brand_type":"abdl",
+                             "alt_bases":["https://www.babykins.com","https://babykins.com"]},
+    "Little Northwood":     {"type":"shopify_probe", "brand":"Little Northwood","currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://www.littlenorthwood.com","https://littlenorthwood.com"]},
+    "ABDL Company":         {"type":"shopify_probe", "brand":"ABDL Company",   "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://abdlcompany.com","https://www.abdlcompany.com"]},
+    "Dotty Diaper UK":      {"type":"shopify_probe", "brand":"Dotty Diaper",   "currency":"gbp","brand_type":"abdl",
+                             "alt_bases":["https://www.dottythediaper.co.uk","https://dottythediaper.co.uk"]},
+    "Changing Times":       {"type":"shopify_probe", "brand":"Changing Times", "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://changingtimes.org","https://www.changingtimes.org",
+                                          "https://changingtimesdiaperco.com"]},
+    "Cushies":              {"type":"shopify_probe", "brand":"Cushies",        "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://cushiesbottoms.com","https://www.cushiesbottoms.com"]},
+    "JaJo Diapers":         {"type":"shopify_probe", "brand":"JaJo",           "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://jajodiapers.com","https://www.jajodiapers.com"]},
+    "Tykables EU":          {"type":"shopify",       "base":"https://eu.tykables.com","brand":"Tykables","currency":"eur","brand_type":"abdl"},
+    "My Plastic Pants":     {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://myplasticpants.com","https://www.myplasticpants.com"]},
+    "ABDLCloth":            {"type":"shopify_probe", "brand":"ABDLCloth",      "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://abdlcloth.com","https://www.abdlcloth.com"]},
+    "Lil Kink Boutique":    {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"abdl",
+                             "alt_bases":["https://lilkinkboutique.com","https://www.lilkinkboutique.com"]},
+    "AB Universe Japan":    {"type":"shopify_probe", "brand":"ABU",            "currency":"jpy","brand_type":"abdl",
+                             "alt_bases":["https://jp.abuniverse.com"]},
+    # ── Age Regression / Little Space ─────────────────────────────────
+    "DDLG World":           {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://ddlgworld.com","https://www.ddlgworld.com"]},
+    "Kawaii Goodsn":        {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://www.kawaiigoodsn.com","https://kawaiigoodsn.com"]},
+    "Blippo Kawaii":        {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://www.blippo.com","https://blippo.com"]},
+    "Sanrio Shop":          {"type":"html",          "base":"https://www.sanrio.com/collections/all","brand":"Sanrio","currency":"usd","brand_type":"regression",
+                             "selectors":{"product_link":"a[href*='/products/']","link_filter":"/products/","title":"h1","price":".price"}},
+    "Littleforbig Bottles": {"type":"shopify_probe", "brand":"Little For Big", "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://www.littleforbig.com"]},
+    # Newly added regression / little space stores
+    "DDLG Playground":      {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://ddlgplayground.com","https://www.ddlgplayground.com"]},
+    "Little ABCs":          {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://littleabcs.com","https://www.littleabcs.com"]},
+    "Littles Closet":       {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://littlescloset.com","https://www.littlescloset.com"]},
+    "Funshine Express":     {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://funshineexpress.com","https://www.funshineexpress.com"]},
+    "CuddleBug":            {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://cuddlebugdiapers.com","https://www.cuddlebugdiapers.com"]},
+    "Little Dreamers":      {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"regression",
+                             "alt_bases":["https://littledreamers.shop","https://www.littledreamers.shop"]},
+    # ── Medical / Incontinence ─────────────────────────────────────────
+    "NorthShore Care Supply":{"type":"shopify_probe","brand":"NorthShore Care","currency":"usd","brand_type":"medical",
+                              "alt_bases":["https://northshorecare.com","https://www.northshorecare.com"]},
+    "Carewell":             {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://www.carewell.com"]},
+    "Tranquility Products": {"type":"shopify_probe", "brand":"Tranquility",    "currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://www.tranquilityproducts.com"]},
+    "Unique Wellness":      {"type":"shopify_probe", "brand":"Unique Wellness","currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://wellnessbriefs.com","https://www.wellnessbriefs.com"]},
+    "Abena Global":         {"type":"shopify_probe", "brand":"Abena",          "currency":"usd","brand_type":"both",
+                             "alt_bases":["https://www.abena.com","https://abena.com"]},
+    "DiapersEtc":           {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://www.diapersetc.com"]},
+    "Parentgiving":         {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://www.parentgiving.com"]},
+    "XP Medical":           {"type":"shopify_probe", "brand":"",               "currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://www.xpmedical.com","https://xpmedical.com"]},
+    "Attends Shop":         {"type":"shopify_probe", "brand":"Attends",        "currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://shop.attends.com"]},
+    "Prevail Products":     {"type":"shopify_probe", "brand":"Prevail",        "currency":"usd","brand_type":"medical",
+                             "alt_bases":["https://prevailproducts.com","https://www.prevailproducts.com"]},
+    "HDIS":                 {"type":"html",          "base":"https://www.hdis.com/incontinence","brand":"","currency":"usd","brand_type":"medical",
+                             "selectors":{"product_link":"a[href*='/incontinence/']","link_filter":"/incontinence/",
+                                          "title":"h1","price":".price,.product-price"}},
+    "Vitality Medical":     {"type":"html",          "base":"https://www.vitalitymedical.com/briefs.html","brand":"","currency":"usd","brand_type":"medical",
+                             "selectors":{"product_link":"a[href*='vitalitymedical.com'][href*='.html']","link_filter":"vitalitymedical.com",
+                                          "title":"h1","price":".price,.our-price"}},
+    "Personally Delivered": {"type":"html",          "base":"https://www.personallydelivered.com/adult-diapers","brand":"","currency":"usd","brand_type":"medical",
+                             "selectors":{"product_link":"a.product-item-name","link_filter":"/product",
+                                          "title":"h1.page-title","price":".price"}},
+    "Health Products For You":{"type":"html",        "base":"https://www.healthproductsforyou.com/c-adult-diapers.html","brand":"","currency":"usd","brand_type":"medical",
+                               "selectors":{"product_link":"a.product-name","link_filter":"/p-","title":"h1","price":".our-price"}},
 }
 
 
@@ -881,27 +803,6 @@ def _do_scrape(tb, name, profile, pcb=None, lcb=None):
             return _crinklz(tb, brand_name, name, pcb)
         lg(f"  ⚠ Unknown custom fn"); return []
 
-    elif stype == "walmart":
-        return _walmart(tb, profile["url"], name, pcb)
-
-    elif stype == "target":
-        return _target(tb, profile["url"], name, pcb)
-
-    elif stype == "amazon":
-        return _amazon(tb, profile["url"], name, pcb)
-
-    elif stype == "pharmacy":
-        return _pharmacy(tb, profile["url"], name, pcb)
-
-    elif stype == "dollar_general":
-        return _dollar_general(tb, profile["url"], name, pcb)
-
-    elif stype == "buybuy_baby":
-        return _buybuy_baby(tb, profile["url"], name, pcb)
-
-    elif stype == "costco":
-        return _costco(tb, profile["url"], name, pcb)
-
     return []
 
 
@@ -917,6 +818,13 @@ def _scrape_site_worker(site, pcb, lcb, semaphore):
     profile = PROFILES.get(name)
 
     with semaphore:
+        # DNS pre-check: skip dead domains without launching Chromium
+        _check = (profile.get("alt_bases") or [site.get("url","")])[0] if profile else site.get("url","")
+        if _check and not _dns_ok(_check):
+            msg = f"⊘ [{name}] skipped — host unreachable"
+            if lcb: lcb(msg)
+            add_scrape_log(site["id"], started, datetime.now().isoformat(), 0, 0, "SKIP", "DNS unreachable")
+            return {"site":name,"status":"SKIP","found":0,"added":0,"error":"DNS unreachable"}
         if lcb: lcb(f"🌐 [{name}] starting…")
         try:
             with _ThreadBrowser() as tb:
@@ -928,11 +836,23 @@ def _scrape_site_worker(site, pcb, lcb, semaphore):
                         products = _shopify(tb, root, "", name, pcb)
                     else:
                         products = _html(tb, site["url"], "", name, {}, pcb)
+
+                # If browser died during scrape, report as crash not empty result
+                if tb._dead and not products:
+                    raise RuntimeError("Browser crashed mid-scrape — no products collected")
+
             found  = len(products)
             for p in products: upsert_product(p)
             status, err = "SUCCESS", ""
+
         except Exception as e:
-            found = 0; status, err = "ERROR", str(e)
+            found = 0; status = "ERROR"; err = str(e)
+            # Distinguish crash vs network error in the log
+            crash_sigs = ("connection closed", "target closed", "browser has been closed",
+                          "crashed", "browser crashed")
+            if any(sig in err.lower() for sig in crash_sigs):
+                status = "CRASH"
+                if lcb: lcb(f"  💥 [{name}] browser crashed — other sites unaffected (each has own browser)")
             log.exception(f"Worker error [{name}]: {e}")
 
     finished = datetime.now().isoformat()
@@ -960,7 +880,7 @@ def scrape_all(enabled_only=True, pcb=None, lcb=None, force=False):
     semaphore = threading.Semaphore(MAX_CONCURRENT)
     results   = []
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT,
-                            thread_name_prefix="abdl-scrape") as pool:
+                            thread_name_prefix="scrape-worker") as pool:
         futures = {pool.submit(_scrape_site_worker, s, pcb, lcb, semaphore): s
                    for s in due}
         for fut in as_completed(futures):
